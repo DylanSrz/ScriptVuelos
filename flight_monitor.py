@@ -14,11 +14,11 @@ from email.mime.multipart import MIMEMultipart
 # ─── CONFIGURACIÓN ─────────────────────────────────────────────────────────────
 ORIGIN_IDA      = "BAQ"
 DESTINATION_IDA = "BOG"
-DATE_IDA        = "2026-06-23"
+DATE_IDA        = "2026-07-23"
 
 ORIGIN_VUELTA      = "BOG"
 DESTINATION_VUELTA = "BAQ"
-DATE_VUELTA        = "2026-06-26"
+DATE_VUELTA        = "2026-07-26"
 
 PRECIO_MAXIMO_COP = 200_000          # Solo se notifican vuelos <= este valor
 
