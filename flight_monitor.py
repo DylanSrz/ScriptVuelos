@@ -1,6 +1,6 @@
 """
 Monitoreo de tiquetes BAQ → BOG y BOG → BAQ
-Usa la API de Aviasales (gratuita) para consultar precios.
+Usa SerpAPI (Google Flights) — cobertura completa de aerolíneas en Colombia.
 Notifica por Gmail si el precio está por debajo del umbral definido.
 """
 
@@ -21,52 +21,54 @@ DESTINATION_VUELTA = "BAQ"
 DATE_VUELTA        = "2026-06-26"
 
 PRECIO_MAXIMO_COP = 200_000          # Umbral por trayecto
-CURRENCY          = "COP"
 
-# Credenciales Gmail (se leen desde variables de entorno / GitHub Secrets)
-GMAIL_USER     = os.environ["GMAIL_USER"]       # tu correo @gmail.com
-GMAIL_PASSWORD = os.environ["GMAIL_PASSWORD"]   # contraseña de aplicación
-NOTIFY_EMAIL   = os.environ["NOTIFY_EMAIL"]     # a quién enviar (puede ser el mismo)
+# Credenciales (variables de entorno / GitHub Secrets)
+GMAIL_USER     = os.environ["GMAIL_USER"]
+GMAIL_PASSWORD = os.environ["GMAIL_PASSWORD"]
+NOTIFY_EMAIL   = os.environ["NOTIFY_EMAIL"]
+SERPAPI_KEY    = os.environ["SERPAPI_KEY"]
 
-# API Aviasales (token gratuito)
-AVIASALES_TOKEN = os.environ["AVIASALES_TOKEN"]
-AVIASALES_URL   = "https://api.travelpayouts.com/v1/prices/cheap"
+SERPAPI_URL = "https://serpapi.com/search.json"
 # ───────────────────────────────────────────────────────────────────────────────
 
 
 def buscar_precio(origin: str, destination: str, date: str) -> dict | None:
-    """Consulta el precio más barato para una ruta y fecha dada."""
+    """Consulta Google Flights vía SerpAPI."""
     params = {
-        "origin":       origin,
-        "destination":  destination,
-        "depart_date":  date,         # formato YYYY-MM-DD
-        "currency":     CURRENCY,
-        "token":        AVIASALES_TOKEN,
-        "limit":        1,
+        "engine":           "google_flights",
+        "departure_id":     origin,
+        "arrival_id":       destination,
+        "outbound_date":    date,
+        "type":             "2",          # 2 = one-way (consultamos cada trayecto por separado)
+        "currency":         "COP",
+        "hl":               "es",
+        "gl":               "co",
+        "api_key":          SERPAPI_KEY,
     }
     try:
-        resp = requests.get(AVIASALES_URL, params=params, timeout=15)
+        resp = requests.get(SERPAPI_URL, params=params, timeout=30)
         resp.raise_for_status()
-        data = resp.json().get("data", {})
+        data = resp.json()
 
-        # La respuesta tiene la forma: {"data": {"BOG": {"0": {price, airline, ...}}}}
-        if not data:
+        # Google Flights devuelve "best_flights" (recomendados) y "other_flights"
+        vuelos = data.get("best_flights") or data.get("other_flights") or []
+        if not vuelos:
+            print(f"    Sin vuelos en respuesta para {origin}→{destination} {date}")
             return None
 
-        dest_data = data.get(destination, {})
-        if not dest_data:
-            return None
+        # El primero es el más barato (Google ya los ordena)
+        mejor = min(vuelos, key=lambda v: v.get("price", 9_999_999))
+        segmento = mejor.get("flights", [{}])[0]
 
-        # Tomar el vuelo más barato
-        vuelo = list(dest_data.values())[0]
         return {
-            "precio":    vuelo.get("price", 0),
-            "aerolinea": vuelo.get("airline", "N/A"),
-            "numero":    vuelo.get("flight_number", "N/A"),
-            "salida":    vuelo.get("departure_at", "N/A"),
+            "precio":    mejor.get("price", 0),
+            "aerolinea": segmento.get("airline", "N/A"),
+            "numero":    segmento.get("flight_number", "N/A"),
+            "salida":    segmento.get("departure_airport", {}).get("time", "N/A"),
+            "duracion":  mejor.get("total_duration", 0),
         }
     except Exception as e:
-        print(f"[ERROR] Al consultar {origin}→{destination} {date}: {e}")
+        print(f"[ERROR] {origin}→{destination} {date}: {e}")
         return None
 
 
@@ -75,7 +77,6 @@ def formatear_cop(valor: int) -> str:
 
 
 def enviar_correo(asunto: str, cuerpo_html: str):
-    """Envía un correo usando Gmail SMTP."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = asunto
     msg["From"]    = GMAIL_USER
@@ -99,11 +100,12 @@ def construir_html(resultados: list[dict]) -> str:
             <td style="padding:10px;border-bottom:1px solid #e5e7eb">{r['fecha']}</td>
             <td style="padding:10px;border-bottom:1px solid #e5e7eb;font-weight:bold;color:{color}">{formatear_cop(r['precio'])}</td>
             <td style="padding:10px;border-bottom:1px solid #e5e7eb">{r['aerolinea']}</td>
+            <td style="padding:10px;border-bottom:1px solid #e5e7eb">{r['duracion']} min</td>
             <td style="padding:10px;border-bottom:1px solid #e5e7eb">{badge}</td>
         </tr>"""
 
     return f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto">
+    <html><body style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto">
       <div style="background:#1e40af;color:white;padding:20px;border-radius:8px 8px 0 0">
         <h2 style="margin:0">✈️ Monitor de Tiquetes BAQ ↔ BOG</h2>
         <p style="margin:4px 0 0;opacity:.8">Revisión del {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
@@ -117,13 +119,14 @@ def construir_html(resultados: list[dict]) -> str:
               <th style="padding:10px;text-align:left">Fecha</th>
               <th style="padding:10px;text-align:left">Precio</th>
               <th style="padding:10px;text-align:left">Aerolínea</th>
+              <th style="padding:10px;text-align:left">Duración</th>
               <th style="padding:10px;text-align:left">Estado</th>
             </tr>
           </thead>
           <tbody>{filas}</tbody>
         </table>
         <p style="color:#6b7280;font-size:12px;margin-top:16px">
-          Este correo fue enviado automáticamente por tu monitor de vuelos en GitHub Actions.
+          Datos vía Google Flights · Enviado automáticamente por GitHub Actions.
         </p>
       </div>
     </body></html>
@@ -136,53 +139,49 @@ def main():
     resultados = []
     hay_alerta = False
 
-    # ── Vuelo de ida ──
+    # ── IDA ──
     ida = buscar_precio(ORIGIN_IDA, DESTINATION_IDA, DATE_IDA)
     if ida:
         alerta = ida["precio"] <= PRECIO_MAXIMO_COP
-        if alerta:
-            hay_alerta = True
+        hay_alerta = hay_alerta or alerta
         resultados.append({
             "ruta":      f"{ORIGIN_IDA} → {DESTINATION_IDA}",
             "fecha":     DATE_IDA,
             "precio":    ida["precio"],
             "aerolinea": ida["aerolinea"],
+            "duracion":  ida["duracion"],
             "alerta":    alerta,
         })
-        print(f"  IDA:    {formatear_cop(ida['precio'])} — {'¡ALERTA!' if alerta else 'sin alerta'}")
+        print(f"  IDA:    {formatear_cop(ida['precio'])} ({ida['aerolinea']}) — {'¡ALERTA!' if alerta else 'sin alerta'}")
     else:
-        print("  IDA:    no se encontraron resultados.")
+        print("  IDA:    sin resultados.")
 
-    # ── Vuelo de regreso ──
+    # ── VUELTA ──
     vuelta = buscar_precio(ORIGIN_VUELTA, DESTINATION_VUELTA, DATE_VUELTA)
     if vuelta:
         alerta = vuelta["precio"] <= PRECIO_MAXIMO_COP
-        if alerta:
-            hay_alerta = True
+        hay_alerta = hay_alerta or alerta
         resultados.append({
             "ruta":      f"{ORIGIN_VUELTA} → {DESTINATION_VUELTA}",
             "fecha":     DATE_VUELTA,
             "precio":    vuelta["precio"],
             "aerolinea": vuelta["aerolinea"],
+            "duracion":  vuelta["duracion"],
             "alerta":    alerta,
         })
-        print(f"  VUELTA: {formatear_cop(vuelta['precio'])} — {'¡ALERTA!' if alerta else 'sin alerta'}")
+        print(f"  VUELTA: {formatear_cop(vuelta['precio'])} ({vuelta['aerolinea']}) — {'¡ALERTA!' if alerta else 'sin alerta'}")
     else:
-        print("  VUELTA: no se encontraron resultados.")
+        print("  VUELTA: sin resultados.")
 
     if not resultados:
-        print("No hay resultados para enviar. Saliendo.")
+        print("No hay resultados para enviar.")
         return
 
-    # ── Enviar correo ──
-    # Siempre notifica (para ver el estado diario).
-    # Si solo quieres correo cuando hay precio bajo, cambia la condición a: if hay_alerta
     asunto = (
         "✅ ¡Tiquete BAQ↔BOG bajo tu límite!" if hay_alerta
         else f"✈️ Monitor vuelos BAQ↔BOG — {datetime.now().strftime('%d/%m/%Y')}"
     )
-    html = construir_html(resultados)
-    enviar_correo(asunto, html)
+    enviar_correo(asunto, construir_html(resultados))
 
 
 if __name__ == "__main__":
