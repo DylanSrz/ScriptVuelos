@@ -1,7 +1,7 @@
 """
 Monitoreo de tiquetes BAQ → BOG y BOG → BAQ
-Usa SerpAPI (Google Flights) — cobertura completa de aerolíneas en Colombia.
-Notifica por Gmail si el precio está por debajo del umbral definido.
+Usa SerpAPI (Google Flights). Lista TODOS los vuelos por debajo del umbral.
+Incluye link directo a Google Flights para reservar.
 """
 
 import os
@@ -20,9 +20,8 @@ ORIGIN_VUELTA      = "BOG"
 DESTINATION_VUELTA = "BAQ"
 DATE_VUELTA        = "2026-06-26"
 
-PRECIO_MAXIMO_COP = 200_000          # Umbral por trayecto
+PRECIO_MAXIMO_COP = 200_000          # Solo se notifican vuelos <= este valor
 
-# Credenciales (variables de entorno / GitHub Secrets)
 GMAIL_USER     = os.environ["GMAIL_USER"]
 GMAIL_PASSWORD = os.environ["GMAIL_PASSWORD"]
 NOTIFY_EMAIL   = os.environ["NOTIFY_EMAIL"]
@@ -32,44 +31,63 @@ SERPAPI_URL = "https://serpapi.com/search.json"
 # ───────────────────────────────────────────────────────────────────────────────
 
 
-def buscar_precio(origin: str, destination: str, date: str) -> dict | None:
-    """Consulta Google Flights vía SerpAPI."""
+def google_flights_link(origin: str, destination: str, date: str) -> str:
+    """Genera un link directo de búsqueda en Google Flights."""
+    return (
+        f"https://www.google.com/travel/flights"
+        f"?q=Flights%20from%20{origin}%20to%20{destination}%20on%20{date}"
+        f"&curr=COP&hl=es"
+    )
+
+
+def buscar_vuelos(origin: str, destination: str, date: str) -> list[dict]:
+    """Devuelve TODOS los vuelos disponibles para la ruta y fecha."""
     params = {
-        "engine":           "google_flights",
-        "departure_id":     origin,
-        "arrival_id":       destination,
-        "outbound_date":    date,
-        "type":             "2",          # 2 = one-way (consultamos cada trayecto por separado)
-        "currency":         "COP",
-        "hl":               "es",
-        "gl":               "co",
-        "api_key":          SERPAPI_KEY,
+        "engine":        "google_flights",
+        "departure_id":  origin,
+        "arrival_id":    destination,
+        "outbound_date": date,
+        "type":          "2",          # one-way
+        "currency":      "COP",
+        "hl":            "es",
+        "gl":            "co",
+        "api_key":       SERPAPI_KEY,
     }
     try:
         resp = requests.get(SERPAPI_URL, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
 
-        # Google Flights devuelve "best_flights" (recomendados) y "other_flights"
-        vuelos = data.get("best_flights") or data.get("other_flights") or []
-        if not vuelos:
-            print(f"    Sin vuelos en respuesta para {origin}→{destination} {date}")
-            return None
+        # Combinar "best_flights" (recomendados) y "other_flights" (los demás)
+        todos = (data.get("best_flights") or []) + (data.get("other_flights") or [])
 
-        # El primero es el más barato (Google ya los ordena)
-        mejor = min(vuelos, key=lambda v: v.get("price", 9_999_999))
-        segmento = mejor.get("flights", [{}])[0]
+        vuelos_parseados = []
+        for v in todos:
+            segmento = (v.get("flights") or [{}])[0]
+            vuelos_parseados.append({
+                "precio":     v.get("price", 0),
+                "aerolinea":  segmento.get("airline", "N/A"),
+                "numero":     segmento.get("flight_number", "N/A"),
+                "hora_salida":segmento.get("departure_airport", {}).get("time", "N/A"),
+                "hora_llegada": segmento.get("arrival_airport", {}).get("time", "N/A"),
+                "duracion":   v.get("total_duration", 0),
+            })
 
-        return {
-            "precio":    mejor.get("price", 0),
-            "aerolinea": segmento.get("airline", "N/A"),
-            "numero":    segmento.get("flight_number", "N/A"),
-            "salida":    segmento.get("departure_airport", {}).get("time", "N/A"),
-            "duracion":  mejor.get("total_duration", 0),
-        }
+        # Eliminar duplicados (mismo vuelo puede aparecer en best y en other)
+        vistos = set()
+        unicos = []
+        for v in vuelos_parseados:
+            clave = (v["aerolinea"], v["numero"], v["hora_salida"], v["precio"])
+            if clave not in vistos:
+                vistos.add(clave)
+                unicos.append(v)
+
+        # Ordenar por precio ascendente
+        return sorted(unicos, key=lambda x: x["precio"])
+
     except Exception as e:
         print(f"[ERROR] {origin}→{destination} {date}: {e}")
-        return None
+        return []
 
 
 def formatear_cop(valor: int) -> str:
@@ -89,44 +107,69 @@ def enviar_correo(asunto: str, cuerpo_html: str):
     print("[OK] Correo enviado.")
 
 
-def construir_html(resultados: list[dict]) -> str:
+def construir_seccion_ruta(titulo: str, fecha: str, link: str,
+                            vuelos_bajo_umbral: list[dict],
+                            precio_minimo_total: int | None) -> str:
+    """Construye el bloque HTML para una ruta."""
+    if not vuelos_bajo_umbral:
+        # Mostrar el precio mínimo aunque no cumpla
+        info_extra = (
+            f"<p style='color:#dc2626;margin:8px 0 0'>"
+            f"Sin vuelos bajo ${PRECIO_MAXIMO_COP:,.0f} COP. "
+            f"Precio más bajo encontrado: <strong>{formatear_cop(precio_minimo_total) if precio_minimo_total else 'N/A'}</strong>"
+            f"</p>"
+        )
+        return f"""
+        <div style="background:white;border-radius:8px;padding:16px;margin-bottom:16px;border-left:4px solid #dc2626">
+            <h3 style="margin:0 0 4px;color:#1e40af">{titulo}</h3>
+            <p style="margin:0;color:#6b7280">Fecha: {fecha}</p>
+            {info_extra}
+            <p style="margin:12px 0 0"><a href="{link}" style="background:#1e40af;color:white;padding:8px 14px;border-radius:6px;text-decoration:none;font-size:14px">🔍 Ver en Google Flights</a></p>
+        </div>
+        """
+
     filas = ""
-    for r in resultados:
-        color = "#16a34a" if r["alerta"] else "#374151"
-        badge = "✅ ¡DEBAJO DEL LÍMITE!" if r["alerta"] else "⏳ Por encima del límite"
+    for v in vuelos_bajo_umbral:
         filas += f"""
         <tr>
-            <td style="padding:10px;border-bottom:1px solid #e5e7eb">{r['ruta']}</td>
-            <td style="padding:10px;border-bottom:1px solid #e5e7eb">{r['fecha']}</td>
-            <td style="padding:10px;border-bottom:1px solid #e5e7eb;font-weight:bold;color:{color}">{formatear_cop(r['precio'])}</td>
-            <td style="padding:10px;border-bottom:1px solid #e5e7eb">{r['aerolinea']}</td>
-            <td style="padding:10px;border-bottom:1px solid #e5e7eb">{r['duracion']} min</td>
-            <td style="padding:10px;border-bottom:1px solid #e5e7eb">{badge}</td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb;font-weight:bold;color:#16a34a">{formatear_cop(v['precio'])}</td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb">{v['aerolinea']} {v['numero']}</td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb">{v['hora_salida']} → {v['hora_llegada']}</td>
+            <td style="padding:8px;border-bottom:1px solid #e5e7eb">{v['duracion']} min</td>
         </tr>"""
 
     return f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto">
+    <div style="background:white;border-radius:8px;padding:16px;margin-bottom:16px;border-left:4px solid #16a34a">
+        <h3 style="margin:0 0 4px;color:#1e40af">{titulo}</h3>
+        <p style="margin:0 0 12px;color:#6b7280">Fecha: {fecha} · <strong style="color:#16a34a">{len(vuelos_bajo_umbral)} vuelo(s) bajo ${PRECIO_MAXIMO_COP:,.0f} COP</strong></p>
+        <table style="width:100%;border-collapse:collapse;font-size:14px">
+            <thead style="background:#f0fdf4">
+                <tr>
+                    <th style="padding:8px;text-align:left">Precio</th>
+                    <th style="padding:8px;text-align:left">Vuelo</th>
+                    <th style="padding:8px;text-align:left">Horario</th>
+                    <th style="padding:8px;text-align:left">Duración</th>
+                </tr>
+            </thead>
+            <tbody>{filas}</tbody>
+        </table>
+        <p style="margin:12px 0 0"><a href="{link}" style="background:#16a34a;color:white;padding:8px 14px;border-radius:6px;text-decoration:none;font-size:14px">🎟️ Reservar en Google Flights</a></p>
+    </div>
+    """
+
+
+def construir_html(secciones_html: list[str]) -> str:
+    return f"""
+    <html><body style="font-family:Arial,sans-serif;max-width:720px;margin:0 auto;background:#f9fafb;padding:20px">
       <div style="background:#1e40af;color:white;padding:20px;border-radius:8px 8px 0 0">
         <h2 style="margin:0">✈️ Monitor de Tiquetes BAQ ↔ BOG</h2>
-        <p style="margin:4px 0 0;opacity:.8">Revisión del {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+        <p style="margin:4px 0 0;opacity:.85">Revisión del {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
       </div>
-      <div style="padding:20px;background:#f9fafb;border-radius:0 0 8px 8px">
-        <p>Umbral máximo configurado: <strong>{formatear_cop(PRECIO_MAXIMO_COP)}</strong> por trayecto.</p>
-        <table style="width:100%;border-collapse:collapse;background:white;border-radius:6px;overflow:hidden">
-          <thead style="background:#e0e7ff">
-            <tr>
-              <th style="padding:10px;text-align:left">Ruta</th>
-              <th style="padding:10px;text-align:left">Fecha</th>
-              <th style="padding:10px;text-align:left">Precio</th>
-              <th style="padding:10px;text-align:left">Aerolínea</th>
-              <th style="padding:10px;text-align:left">Duración</th>
-              <th style="padding:10px;text-align:left">Estado</th>
-            </tr>
-          </thead>
-          <tbody>{filas}</tbody>
-        </table>
-        <p style="color:#6b7280;font-size:12px;margin-top:16px">
-          Datos vía Google Flights · Enviado automáticamente por GitHub Actions.
+      <div style="padding:20px;background:white;border-radius:0 0 8px 8px">
+        <p style="margin:0 0 16px">Umbral configurado: <strong>{formatear_cop(PRECIO_MAXIMO_COP)}</strong> por trayecto.</p>
+        {''.join(secciones_html)}
+        <p style="color:#9ca3af;font-size:12px;margin-top:20px;text-align:center">
+          Datos vía Google Flights · Enviado automáticamente por GitHub Actions
         </p>
       </div>
     </body></html>
@@ -136,52 +179,42 @@ def construir_html(resultados: list[dict]) -> str:
 def main():
     print(f"[{datetime.now()}] Iniciando búsqueda de vuelos...")
 
-    resultados = []
     hay_alerta = False
+    secciones = []
 
-    # ── IDA ──
-    ida = buscar_precio(ORIGIN_IDA, DESTINATION_IDA, DATE_IDA)
-    if ida:
-        alerta = ida["precio"] <= PRECIO_MAXIMO_COP
-        hay_alerta = hay_alerta or alerta
-        resultados.append({
-            "ruta":      f"{ORIGIN_IDA} → {DESTINATION_IDA}",
-            "fecha":     DATE_IDA,
-            "precio":    ida["precio"],
-            "aerolinea": ida["aerolinea"],
-            "duracion":  ida["duracion"],
-            "alerta":    alerta,
-        })
-        print(f"  IDA:    {formatear_cop(ida['precio'])} ({ida['aerolinea']}) — {'¡ALERTA!' if alerta else 'sin alerta'}")
-    else:
-        print("  IDA:    sin resultados.")
+    rutas = [
+        ("✈️ IDA",    ORIGIN_IDA,    DESTINATION_IDA,    DATE_IDA),
+        ("🔄 VUELTA", ORIGIN_VUELTA, DESTINATION_VUELTA, DATE_VUELTA),
+    ]
 
-    # ── VUELTA ──
-    vuelta = buscar_precio(ORIGIN_VUELTA, DESTINATION_VUELTA, DATE_VUELTA)
-    if vuelta:
-        alerta = vuelta["precio"] <= PRECIO_MAXIMO_COP
-        hay_alerta = hay_alerta or alerta
-        resultados.append({
-            "ruta":      f"{ORIGIN_VUELTA} → {DESTINATION_VUELTA}",
-            "fecha":     DATE_VUELTA,
-            "precio":    vuelta["precio"],
-            "aerolinea": vuelta["aerolinea"],
-            "duracion":  vuelta["duracion"],
-            "alerta":    alerta,
-        })
-        print(f"  VUELTA: {formatear_cop(vuelta['precio'])} ({vuelta['aerolinea']}) — {'¡ALERTA!' if alerta else 'sin alerta'}")
-    else:
-        print("  VUELTA: sin resultados.")
+    for titulo, origin, destination, date in rutas:
+        print(f"\n  Buscando {origin}→{destination} ({date})...")
+        todos = buscar_vuelos(origin, destination, date)
+        bajo_umbral = [v for v in todos if v["precio"] <= PRECIO_MAXIMO_COP]
+        precio_min = todos[0]["precio"] if todos else None
 
-    if not resultados:
-        print("No hay resultados para enviar.")
-        return
+        if bajo_umbral:
+            hay_alerta = True
+            print(f"    ✅ {len(bajo_umbral)} vuelo(s) bajo {formatear_cop(PRECIO_MAXIMO_COP)}:")
+            for v in bajo_umbral:
+                print(f"       - {formatear_cop(v['precio'])} | {v['aerolinea']} | {v['hora_salida']}")
+        else:
+            print(f"    ⏳ Sin vuelos bajo umbral. Mín: {formatear_cop(precio_min) if precio_min else 'N/A'}")
+
+        link = google_flights_link(origin, destination, date)
+        secciones.append(construir_seccion_ruta(
+            titulo=f"{titulo}: {origin} → {destination}",
+            fecha=date,
+            link=link,
+            vuelos_bajo_umbral=bajo_umbral,
+            precio_minimo_total=precio_min,
+        ))
 
     asunto = (
-        "✅ ¡Tiquete BAQ↔BOG bajo tu límite!" if hay_alerta
+        f"✅ ¡Hay tiquetes BAQ↔BOG bajo {formatear_cop(PRECIO_MAXIMO_COP)}!" if hay_alerta
         else f"✈️ Monitor vuelos BAQ↔BOG — {datetime.now().strftime('%d/%m/%Y')}"
     )
-    enviar_correo(asunto, construir_html(resultados))
+    enviar_correo(asunto, construir_html(secciones))
 
 
 if __name__ == "__main__":
