@@ -1,112 +1,88 @@
-# ✈️ Monitor de Tiquetes BAQ ↔ BOG
+# ✈️ ScriptVuelos · Monitor de tiquetes BAQ ↔ BOG
 
-Automatización que corre **todos los días a las 7 AM** (hora Colombia) usando GitHub Actions y te notifica por Gmail cuando encuentra precios por debajo de tu límite.
+Script en Python que revisaba cada día los precios de vuelos entre Barranquilla y Bogotá en Google Flights y enviaba un reporte en HTML por correo. Corría solo con GitHub Actions, sin servidor propio.
 
----
+**Estado: terminado.** Cumplió su objetivo: compré los tiquetes y deshabilité el workflow.
 
-## 📁 Estructura del proyecto
+## 💡 El problema
 
+Revisar los precios a mano todos los días es tedioso y es fácil perder una baja de precio. Quería recibir la información en el correo, con los vuelos que estaban por debajo de mi presupuesto.
+
+## ⚙️ Cómo funciona
+
+```mermaid
+flowchart LR
+    A["GitHub Actions<br>cron diario"] --> B["flight_monitor.py"]
+    B -- "ida y vuelta" --> C["SerpAPI<br>Google Flights"]
+    C --> B
+    B -- "reporte HTML" --> D["Gmail SMTP"]
+    D --> E["📬 Mi correo"]
 ```
-tu-repo/
-├── flight_monitor.py
-└── .github/
-    └── workflows/
-        └── flight_monitor.yml
-```
 
----
+1. El workflow se ejecuta a diario, o a mano desde la pestaña **Actions**.
+2. El script consulta la ida y la vuelta, une los resultados, quita duplicados y ordena por precio.
+3. Filtra los vuelos que cuestan igual o menos que `PRECIO_MAXIMO_COP`.
+4. Envía **siempre** un correo con el estado del día:
+   - Bloque verde: tabla con los vuelos bajo el umbral y enlace para reservar.
+   - Bloque rojo: no hay vuelos bajo el umbral, muestra el precio más bajo encontrado.
+   - El asunto cambia cuando hay al menos un vuelo bajo el umbral.
 
-## 🚀 Configuración paso a paso
+## 🧠 Lo que aprendí
 
-### 1. Obtener token gratuito de Aviasales
+- **Validar la fuente de datos antes de construir.** Empecé con la API de Aviasales, pero no devolvía resultados, así que cambié a SerpAPI, que consulta Google Flights.
+- **Un cron de GitHub Actions no es exacto.** El workflow está programado a las 16:05 UTC, pero las últimas ejecuciones arrancaron entre las 17:38 y las 19:53 UTC. Sirve para un reporte diario, no para algo que dependa de la hora exacta.
+- **Secretos fuera del código.** Las credenciales viven en GitHub Secrets y llegan al script como variables de entorno.
 
-1. Regístrate en https://www.travelpayouts.com
-2. Ve a **Herramientas → API** y copia tu **Token**
-3. Guárdalo, lo necesitarás en el paso 3
+## 🛠️ Stack
 
-### 2. Crear contraseña de aplicación en Gmail
+Python 3.12 · `requests` · SerpAPI (Google Flights) · Gmail SMTP · GitHub Actions
 
-> Gmail no permite usar tu contraseña normal en scripts. Necesitas una "App Password".
+## 🚀 Cómo correrlo
 
-1. Ve a https://myaccount.google.com/security
-2. Activa **Verificación en dos pasos** (si no la tienes)
-3. Ve a **Contraseñas de aplicaciones**
-4. Crea una nueva → elige "Correo" y "Windows" → copia los 16 caracteres
+**Necesitas** una llave de [SerpAPI](https://serpapi.com) y una [contraseña de aplicación de Gmail](https://myaccount.google.com/apppasswords).
 
-### 3. Agregar los Secrets en GitHub
+### En GitHub Actions
 
-En tu repositorio de GitHub ve a:
-**Settings → Secrets and variables → Actions → New repository secret**
+1. Haz un fork del repositorio.
+2. En **Settings → Secrets and variables → Actions**, crea estos secrets:
 
-Agrega estos 4 secrets:
+   | Secret | Valor |
+   |---|---|
+   | `GMAIL_USER` | Correo que envía el reporte |
+   | `GMAIL_PASSWORD` | Contraseña de aplicación de 16 caracteres |
+   | `NOTIFY_EMAIL` | Correo que recibe el reporte |
+   | `SERPAPI_KEY` | Llave de SerpAPI |
 
-| Nombre | Valor |
-|--------|-------|
-| `GMAIL_USER` | tu correo Gmail (ej: `tunombre@gmail.com`) |
-| `GMAIL_PASSWORD` | los 16 caracteres del paso anterior |
-| `NOTIFY_EMAIL` | correo donde quieres recibir alertas |
-| `AVIASALES_TOKEN` | token de Travelpayouts del paso 1 |
+3. Ajusta las fechas en `flight_monitor.py`, porque las actuales ya pasaron.
+4. En **Actions → Monitor Tiquetes BAQ BOG**, habilita el workflow y usa **Run workflow**.
 
-### 4. Subir los archivos al repositorio
+### En tu computador
+
+El script lee las variables del entorno. Usa `.env.example` como guía de cuáles necesita.
 
 ```bash
-git init
-git add .
-git commit -m "feat: monitor de vuelos BAQ-BOG"
-git remote add origin https://github.com/TU_USUARIO/TU_REPO.git
-git push -u origin main
+pip install -r requirements.txt
+python flight_monitor.py
 ```
 
-### 5. Activar GitHub Actions
+## 🔧 Personalización
 
-1. Ve a la pestaña **Actions** en tu repositorio
-2. Si te pide activarlos, acepta
-3. Para probar de inmediato: **Actions → Monitor Tiquetes → Run workflow**
-
----
-
-## 📧 Ejemplo de correo que recibirás
-
-El correo llega con:
-- Precio más barato encontrado para cada trayecto
-- Aerolínea que lo opera
-- Indicador visual si está por debajo de $200.000 COP
-
-Si **hay alerta**, el asunto será:
-> ✅ ¡Tiquete BAQ↔BOG bajo tu límite!
-
-Si no hay alerta, igual llega el reporte diario:
-> ✈️ Monitor vuelos BAQ↔BOG — 03/06/2026
-
----
-
-## ⚙️ Personalización
-
-En `flight_monitor.py` puedes cambiar fácilmente:
+En `flight_monitor.py`:
 
 ```python
-PRECIO_MAXIMO_COP = 200_000   # Cambia el umbral
-DATE_IDA          = "2026-06-23"
-DATE_VUELTA       = "2026-06-26"
+ORIGIN_IDA        = "BAQ"
+DESTINATION_IDA   = "BOG"
+DATE_IDA          = "2026-07-23"
+DATE_VUELTA       = "2026-07-26"
+PRECIO_MAXIMO_COP = 200_000
 ```
 
-Para que **solo notifique cuando hay precio bajo** (sin reporte diario), busca esta línea en `main()`:
+El horario está en `.github/workflows/flight_monitor.yml`:
 
-```python
-# Siempre notifica (para ver el estado diario).
-# Si solo quieres correo cuando hay precio bajo, cambia la condición a: if hay_alerta
-```
-
-Y cambia la condición según el comentario.
-
----
-
-## 🕐 Horario del cron
-
-El workflow corre a las **12:00 UTC = 7:00 AM hora Colombia (UTC-5)**.
-
-Para cambiar el horario, edita la línea en el workflow:
 ```yaml
-- cron: "0 12 * * *"
+- cron: "5 16 * * *"   # 16:05 UTC = 11:05 AM en Colombia
 ```
-Usa https://crontab.guru para construir el cron que necesites.
+
+## 📄 Licencia
+
+[MIT](LICENSE)
